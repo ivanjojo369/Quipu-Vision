@@ -1,0 +1,30 @@
+﻿# Local environments / credentials
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.aws/
+
+# Caches and generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+outputs/
+var/
+logs/
+.DS_Store
+Thumbs.db
+*.log
+
+# Generated exports / datasets not intentionally listed
+*.sqlite
+*.sqlite3
