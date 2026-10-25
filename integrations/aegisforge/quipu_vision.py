@@ -33,6 +33,8 @@ Supported operations:
 A2A DataPart input supports reference_image/observed_image/followup_image with
 {mime_type, base64}, while A2A FilePart payloads are normalized by Executor.
 Inline bytes are staged in an isolated, automatically deleted directory.
+The optional observation plan describes a recommended, operator-provided
+follow-up ROI; it does not acquire images or independently certify a change.
 Input paths must be inside the configured input root; annotation targets must
 be inside the configured output root. Both roots can be set via the constructor
 or trusted QUIPU_VISION_INPUT_ROOT / QUIPU_VISION_OUTPUT_ROOT environment vars.
@@ -51,8 +53,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
-from ..contracts import PluginContext, PluginResult
-
+from aegisforge.plugins.contracts import PluginContext, PluginResult
 
 class _RequestError(ValueError):
     """Invalid input supplied by a plugin caller."""
@@ -77,6 +78,20 @@ class QuipuVisionPlugin:
     MIME_SUFFIX = {"image/png": ".png", "image/jpeg": ".jpg", "image/bmp": ".bmp", "image/webp": ".webp"}
     _IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".bmp", ".webp"})
     _ANNOTATION_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg"})
+
+    @staticmethod
+    def _on_aws_lambda() -> bool:
+        """Report runtime context, not proof of a successfully tested deployment.
+
+        Both variables are supplied by Lambda to custom container runtimes.
+        Local Docker processes do not normally have both set. No API calls or
+        account/region identifiers are exposed in the public result.
+        """
+        return bool(os.getenv("AWS_LAMBDA_RUNTIME_API") and os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
+
+    @classmethod
+    def _runtime_environment(cls) -> str:
+        return "aws_lambda" if cls._on_aws_lambda() else "local_or_container"
 
     def __init__(
         self,
@@ -322,14 +337,36 @@ class QuipuVisionPlugin:
                 "sandboxed_annotation_outputs": True,
                 "verification_scope": "persistent_pixel_change_only",
                 "safety_certified": False,
-                "aws_deployed": False,
+                # A runtime signal is not a substitute for AWS invocation logs.
+                "aws_deployed": cls._on_aws_lambda(),
+                "runtime_environment": cls._runtime_environment(),
                 "a2a_auto_registered": False,
             },
             warnings=[],
         )
 
     @staticmethod
-    def _case_result(index: int, report: Any, *, followup_submitted: bool) -> dict[str, Any]:
+    def _suggest_followup_roi(report: Any) -> list[int] | None:
+        """Focus a requested *external* follow-up on the largest changed region.
+
+        Clamp the padded box to the original ROI. This is advice to the caller,
+        not an automatic camera action or a change to the original evidence.
+        """
+        if report.decision.next_action != "request_second_observation":
+            return None
+        if not report.observation.regions:
+            return None
+        x, y, width, height = report.observation.roi_xywh
+        bx, by, bw, bh = report.observation.regions[0].bbox_xywh
+        padding = max(8, (max(bw, bh) + 3) // 4)
+        left = max(x, bx - padding)
+        top = max(y, by - padding)
+        right = min(x + width, bx + bw + padding)
+        bottom = min(y + height, by + bh + padding)
+        return [left, top, right - left, bottom - top]
+
+    @classmethod
+    def _case_result(cls, index: int, report: Any, *, followup_submitted: bool) -> dict[str, Any]:
         # Use the real contracts, not made-up dict keys or a repeat of core.inspect.
         from quipu_vision.schemas import VisionWorkflowResult
         if not isinstance(report, VisionWorkflowResult):
@@ -347,6 +384,13 @@ class QuipuVisionPlugin:
             "regions_total": report.observation.regions_total,
             "followup_submitted": followup_submitted,
             "followup_processed": report.verification is not None,
+            "next_observation_plan": {
+                "action": decision.next_action,
+                "requires_external_image": decision.next_action == "request_second_observation",
+                "suggested_roi_xywh": cls._suggest_followup_roi(report),
+                "reason": decision.reason,
+                "human_approval_required_for_consequential_action": True,
+            },
             "verified": decision.confirmed_pixel_persistence,
             "verification_scope": "persistent_pixel_change_only",
             "human_review_required_for_safety": True,
@@ -421,6 +465,8 @@ class QuipuVisionPlugin:
                     "track": str(getattr(context, "track", "vision")),
                     "capability": self.name,
                     "plugin_version": self.version,
+                    "runtime_environment": self._runtime_environment(),
+                    "aws_runtime_detected": self._on_aws_lambda(),
                     "operation": operation,
                     "status": "completed",
                     "processing_ms": round((time.perf_counter() - started) * 1000, 2),
